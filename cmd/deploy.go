@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"fmt"
+	"github.com/fsnotify/fsnotify"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -16,12 +17,13 @@ import (
 var (
 	dir      string
 	strategy string
+	watch    bool
 )
 
 var deployCmd = &cobra.Command{
-	Use:   "deploy",
+	Use:   "deploy [directory]",
 	Short: "deploy to Atrocity",
-	Long: `Deploy secrets and functions to Atrocity.
+	Long: `Deploy to Atrocity.
 
 Strategies:
 When deploying you'll need to choose a strategy.
@@ -35,25 +37,61 @@ The secret will be available to atrocity functions without the ATROCITY_. For ex
 ATROCITY_PG_CONNECTION will be available as PG_CONNECTION.
 
 Examples:
-	# deploys all *.js files in the current directory to http://localhost:9090 using the bluegreen strategy
-	atroctl -d .
+  # deploys all *.js files in the current directory to http://localhost:9090 using the bluegreen strategy
+  atroctl deploy
 
-	# deploys all *.js files recursively in ~/dev/project/server to http://example.com using the latest revision number in the current directory
-	atroctl -u http://example.com -d ~/dev/project/server -s gitrev`,
-	Run: func(cmd *cobra.Command, args []string) {
-		var err error
-		p("atroctl", "starting deployment to %s\n", url)
-		p("strategy", "using strategy %s\n", strategy)
-		switch strategy {
-		case "bluegreen":
-			err = bluegreen()
-		default:
-			err = fmt.Errorf("strategy (%s) not supported", strategy)
+  # deploys all *.js files recursively in ~/dev/project/server to http://example.com using the latest revision number in the current directory
+  atroctl deploy ~/dev/project/server -u http://example.com -s gitrev`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		printHeader(cmd.Parent().Version)
+		resolveDir(args)
+
+		strategyFunc, err := resolveStrategy()
+		if err != nil {
+			return err
 		}
+
+		err = strategyFunc()
 		if err != nil {
 			p("error", "%s\n", err)
+			return err
 		}
+
+		if watch {
+			err = startWatching(strategyFunc)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
 	},
+}
+
+type strategyFunction func() error
+
+func resolveStrategy() (strategyFunction, error) {
+	switch strategy {
+	case "bluegreen":
+		return bluegreen, nil
+	default:
+		return nil, fmt.Errorf("strategy (%s) not supported", strategy)
+	}
+}
+
+func printHeader(version string) {
+	p("atroctl", "version %s\n", version)
+	p("atroctl", "starting deployment to %s\n", url)
+	p("strategy", "using strategy %s\n", strategy)
+}
+
+func resolveDir(args []string) {
+	if len(args) == 0 {
+		dir = "."
+	} else {
+		dir = args[0]
+	}
 }
 
 func p(key, msg string, args ...interface{}) {
@@ -62,6 +100,47 @@ func p(key, msg string, args ...interface{}) {
 		return
 	}
 	fmt.Printf("%10s: %s", strings.ToUpper(key), fmt.Sprintf(msg, args...))
+}
+
+func startWatching(fn strategyFunction) error {
+	p("watch", "starting to watch directory for changes\n")
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = watcher.Close() }()
+
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&fsnotify.Write == fsnotify.Write {
+					p("watch", "detected file system change\n")
+					err = fn()
+					if err != nil {
+						p("error", "%s\n", err)
+					}
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				p("error", "%s\n", err)
+			}
+		}
+	}()
+
+	err = watcher.Add(dir)
+	if err != nil {
+		return err
+	}
+	<-done
+
+	return nil
 }
 
 func httpPut(url, contentType string, body io.Reader) (*http.Response, error) {
@@ -137,7 +216,7 @@ func deploySecrets(deployId string) error {
 }
 
 func deployFunctions(deployId string) error {
-	p("functions", "starting to deploy functions\n")
+	p("functions", "starting to deploy functions in '%s'\n", dir)
 	files, err := glob(dir, ".js")
 	if err != nil {
 		return fmt.Errorf("error globbing files: %w", err)
@@ -207,7 +286,7 @@ func envvars() []keyval {
 }
 
 func init() {
-	deployCmd.Flags().StringVarP(&dir, "dir", "d", ".", "the directory to scan for js files")
 	deployCmd.Flags().StringVarP(&strategy, "strategy", "s", "bluegreen", "the deployment strategy (bluegreen, gitrev, uuid)")
+	deployCmd.Flags().BoolVarP(&watch, "watch", "w", false, "deploy when directory changes")
 	rootCmd.AddCommand(deployCmd)
 }

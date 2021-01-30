@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	_ "github.com/joho/godotenv/autoload"
 	"github.com/spf13/cobra"
 	"os"
 )
@@ -14,7 +15,7 @@ var (
 
 var rootCmd = &cobra.Command{
 	Use:     "atroctl",
-	Version: "1.0.0",
+	Version: "1.1.0",
 	Short:   "atroctl controls Atrocity instances",
 	Long:    `The atroctl command lets you control instances of Atrocity.`,
 }
