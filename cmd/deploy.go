@@ -20,16 +20,21 @@ var (
 	watch    bool
 )
 
+const (
+	atroctlDir      = "ATROCTL_DIR"
+	atroctlStrategy = "ATROCTL_STRATEGY"
+)
+
 var deployCmd = &cobra.Command{
-	Use:   "deploy [directory]",
+	Use:   fmt.Sprintf("deploy [directory | %s]", atroctlDir),
 	Short: "deploy to Atrocity",
 	Long: `Deploy to Atrocity.
 
 Strategies:
 When deploying you'll need to choose a strategy.
 * bluegreen = rotates between blue and green deployments
-* gitrev    = uses 'git rev-parse HEAD' as the deployment id
-* uuid      = uses a random uuid as the deployment id
+* gitrev    = (TBD) uses 'git rev-parse HEAD' as the deployment id
+* uuid      = (TBD) uses a random uuid as the deployment id
 
 Secrets:
 Any environment variable that starts with ATROCITY_ will be deployed to Atrocity.
@@ -87,11 +92,16 @@ func printHeader(version string) {
 }
 
 func resolveDir(args []string) {
-	if len(args) == 0 {
-		dir = "."
-	} else {
+	if len(args) == 1 {
 		dir = args[0]
+		return
 	}
+	envdir := os.Getenv(atroctlDir)
+	if envdir != "" {
+		dir = envdir
+		return
+	}
+	dir = "."
 }
 
 func p(key, msg string, args ...interface{}) {
@@ -104,6 +114,7 @@ func p(key, msg string, args ...interface{}) {
 
 func startWatching(fn strategyFunction) error {
 	p("watch", "starting to watch directory for changes\n")
+	fmt.Printf("\n\n")
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -124,6 +135,7 @@ func startWatching(fn strategyFunction) error {
 					if err != nil {
 						p("error", "%s\n", err)
 					}
+					fmt.Print("\n\n\a")
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
@@ -143,14 +155,32 @@ func startWatching(fn strategyFunction) error {
 	return nil
 }
 
-func httpPut(url, contentType string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodPut, url, body)
+func httpCall(method, url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, url, body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", contentType)
+	if apiKey != "" {
+		req.Header.Set("API_KEY", apiKey)
+	}
+	if apiSecretKey != "" {
+		req.Header.Set("API_SECRET_KEY", apiSecretKey)
+	}
 	client := &http.Client{}
 	return client.Do(req)
+}
+
+func httpPut(url, contentType string, body io.Reader) (*http.Response, error) {
+	return httpCall(http.MethodPut, url, contentType, body)
+}
+
+func httpPost(url, contentType string, body io.Reader) (*http.Response, error) {
+	return httpCall(http.MethodPost, url, contentType, body)
+}
+
+func httpGet(url string) (*http.Response, error) {
+	return httpCall(http.MethodGet, url, "text/plain", nil)
 }
 
 func bluegreen() error {
@@ -160,8 +190,10 @@ func bluegreen() error {
 	}
 	if deployId == "blue" {
 		deployId = "green"
-	} else {
+	} else if deployId == "green" {
 		deployId = "blue"
+	} else {
+		return fmt.Errorf("failed to get current deploy id")
 	}
 	return deploy(deployId)
 }
@@ -184,7 +216,7 @@ func deploy(deployId string) error {
 }
 
 func getDeployId() (string, error) {
-	resp, err := http.Get(fmt.Sprintf("%s/deploy", url))
+	resp, err := httpGet(fmt.Sprintf("%s/deploy", url))
 	if err != nil {
 		return "", err
 	}
@@ -245,7 +277,7 @@ func deployFunctions(deployId string) error {
 
 func activateDeployment(deployId string) error {
 	p("activate", "starting to activate %s\n", deployId)
-	resp, err := http.Post(fmt.Sprintf("%s/deploy/%s/activate", url, deployId), "text/plain", nil)
+	resp, err := httpPost(fmt.Sprintf("%s/deploy/%s/activate", url, deployId), "text/plain", nil)
 	if err != nil {
 		return fmt.Errorf("error activating deployment: %w", err)
 	}
@@ -286,7 +318,12 @@ func envvars() []keyval {
 }
 
 func init() {
-	deployCmd.Flags().StringVarP(&strategy, "strategy", "s", "bluegreen", "the deployment strategy (bluegreen, gitrev, uuid)")
+	deployCmd.Flags().StringVarP(&strategy, "strategy", "s", "bluegreen",
+		fmt.Sprintf("the deployment strategy (bluegreen, gitrev, uuid) [%s]", atroctlStrategy))
 	deployCmd.Flags().BoolVarP(&watch, "watch", "w", false, "deploy when directory changes")
 	rootCmd.AddCommand(deployCmd)
+
+	if strategy == "" {
+		strategy = os.Getenv(atroctlStrategy)
+	}
 }
