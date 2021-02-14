@@ -34,12 +34,15 @@ func Execute() {
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVarP(&url, "url", "u", "http://localhost:9090", fmt.Sprintf("the url to atrocity [%s]", atroctlUrl))
+	rootCmd.PersistentFlags().StringVarP(&url, "url", "u", "", fmt.Sprintf("the url to atrocity [%s]", atroctlUrl))
 	rootCmd.PersistentFlags().StringVarP(&apiKey, "api-key", "", "", fmt.Sprintf("the api key [%s]", atroctlApiKey))
 	rootCmd.PersistentFlags().StringVarP(&apiSecretKey, "api-secret-key", "", "", fmt.Sprintf("the api secret key [%s]", atroctlApiSecretKey))
 
 	if url == "" {
 		url = os.Getenv(atroctlUrl)
+		if url == "" {
+			url = "http://localhost:9090"
+		}
 	}
 
 	if apiKey == "" {
