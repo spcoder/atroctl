@@ -3,30 +3,34 @@ package cmd
 import (
 	"bytes"
 	"fmt"
-	"github.com/fsnotify/fsnotify"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/fsnotify/fsnotify"
+
 	"github.com/spf13/cobra"
 )
 
 var (
-	dir      string
-	strategy string
-	watch    bool
+	funcDir   string
+	staticDir string
+	strategy  string
+	watch     bool
 )
 
 const (
-	atroctlDir      = "ATROCTL_DIR"
-	atroctlStrategy = "ATROCTL_STRATEGY"
+	atroctlFuncDir   = "ATROCTL_FUNC_DIR"
+	atroctlStaticDir = "ATROCTL_STATIC_DIR"
+	atroctlStrategy  = "ATROCTL_STRATEGY"
 )
 
 var deployCmd = &cobra.Command{
-	Use:   fmt.Sprintf("deploy [directory | %s]", atroctlDir),
+	Use:   "deploy",
 	Short: "deploy to Atrocity",
 	Long: `Deploy to Atrocity.
 
@@ -42,15 +46,15 @@ The secret will be available to atrocity functions without the ATROCITY_. For ex
 ATROCITY_PG_CONNECTION will be available as PG_CONNECTION.
 
 Examples:
-  # deploys all *.js files in the current directory to http://localhost:9090 using the bluegreen strategy
+  # deploys all *.js files recursively in the "src" directory to http://localhost:9090 using the bluegreen strategy
   atroctl deploy
 
-  # deploys all *.js files recursively in ~/dev/project/server to http://example.com using the latest revision number in the current directory
-  atroctl deploy ~/dev/project/server -u http://example.com -s gitrev`,
-	Args: cobra.MaximumNArgs(1),
+  # deploys all *.js files recursively in ~/dev/project/server to https://example.com using the latest revision number in the current directory
+  # also, deploys all files (except hidden) in ~/dev/project/assets to https://example.com as static assets using the same strategy
+  atroctl deploy -f ~/dev/project/server -s ~/dev/project/assets -u https://example.com -s gitrev`,
+	Args: cobra.MaximumNArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		printHeader(cmd.Parent().Version)
-		resolveDir(args)
 
 		strategyFunc, err := resolveStrategy()
 		if err != nil {
@@ -91,19 +95,6 @@ func printHeader(version string) {
 	p("strategy", "using strategy %s\n", strategy)
 }
 
-func resolveDir(args []string) {
-	if len(args) == 1 {
-		dir = args[0]
-		return
-	}
-	envdir := os.Getenv(atroctlDir)
-	if envdir != "" {
-		dir = envdir
-		return
-	}
-	dir = "."
-}
-
 func p(key, msg string, args ...interface{}) {
 	if key == "" {
 		fmt.Printf(msg, args...)
@@ -113,8 +104,7 @@ func p(key, msg string, args ...interface{}) {
 }
 
 func startWatching(fn strategyFunction) error {
-	p("watch", "starting to watch directory for changes\n")
-	fmt.Printf("\n\n")
+	p("watch", "starting to watch directories for changes\n")
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -130,6 +120,7 @@ func startWatching(fn strategyFunction) error {
 					return
 				}
 				if event.Op&fsnotify.Write == fsnotify.Write {
+					fmt.Printf("\n\n")
 					p("watch", "detected file system change\n")
 					err = fn()
 					if err != nil {
@@ -146,7 +137,22 @@ func startWatching(fn strategyFunction) error {
 		}
 	}()
 
-	err = watcher.Add(dir)
+	err = filepath.WalkDir(funcDir, func(path string, d fs.DirEntry, err error) error {
+		if d.IsDir() {
+			p("watch", path+"\n")
+			return watcher.Add(path)
+		}
+		return nil
+	})
+	if staticDir != "" {
+		err = filepath.WalkDir(staticDir, func(path string, d fs.DirEntry, err error) error {
+			if d.IsDir() {
+				p("watch", path+"\n")
+				return watcher.Add(path)
+			}
+			return nil
+		})
+	}
 	if err != nil {
 		return err
 	}
@@ -208,6 +214,10 @@ func deploy(deployId string) error {
 	if err != nil {
 		return err
 	}
+	err = deployStatics(deployId)
+	if err != nil {
+		return err
+	}
 	err = activateDeployment(deployId)
 	if err != nil {
 		return err
@@ -248,8 +258,8 @@ func deploySecrets(deployId string) error {
 }
 
 func deployFunctions(deployId string) error {
-	p("functions", "starting to deploy functions in '%s'\n", dir)
-	files, err := glob(dir, ".js")
+	p("functions", "starting to deploy functions in '%s'\n", funcDir)
+	files, err := glob(funcDir, ".js")
 	if err != nil {
 		return fmt.Errorf("error globbing files: %w", err)
 	}
@@ -273,6 +283,46 @@ func deployFunctions(deployId string) error {
 	}
 	p("functions", "successfully deployed\n")
 	return nil
+}
+
+func deployStatics(deployId string) error {
+	if staticDir == "" {
+		return nil
+	}
+	p("statics", "starting to deploy static files in '%s'\n", staticDir)
+	files, err := globAll(staticDir)
+	if err != nil {
+		return fmt.Errorf("error globbing files: %w", err)
+	}
+	for _, f := range files {
+		p("statics", "deploying file %s", f)
+		contents, err := ioutil.ReadFile(f)
+		if err != nil {
+			return fmt.Errorf("error reading file (%s): %w", f, err)
+		}
+		fpath := filepath.ToSlash(removeDir(f, staticDir))
+		contentType := http.DetectContentType(contents)
+		resp, err := httpPut(fmt.Sprintf("%s/deploy/%s/static/%s", url, deployId, fpath), contentType, bytes.NewReader(contents))
+		if err != nil {
+			return fmt.Errorf("error deploying static file (%s): %w", f, err)
+		}
+		if resp.StatusCode == http.StatusNoContent {
+			p("", " [OK]\n")
+		} else {
+			p("", " [%d]\n", resp.StatusCode)
+			return fmt.Errorf("failed to deploy static file (%s)", f)
+		}
+	}
+	p("statics", "successfully deployed\n")
+	return nil
+}
+
+func removeDir(f, dir string) string {
+	s := strings.Replace(f, dir, "", 1)
+	if strings.HasPrefix(s, "/") {
+		return s[1:]
+	}
+	return s
 }
 
 func activateDeployment(deployId string) error {
@@ -300,6 +350,21 @@ func glob(dir string, ext string) ([]string, error) {
 	return files, err
 }
 
+func globAll(dir string) ([]string, error) {
+	files := make([]string, 0)
+	err := filepath.Walk(dir, func(path string, f os.FileInfo, err error) error {
+		if f.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(filepath.Base(path), ".") {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
+	return files, err
+}
+
 type keyval struct {
 	key   string
 	value string
@@ -317,13 +382,24 @@ func envvars() []keyval {
 	return result
 }
 
+func resolveStringFlag(value, envvar, fallback string) string {
+	if value == "" {
+		value = os.Getenv(envvar)
+	}
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
 func init() {
-	deployCmd.Flags().StringVarP(&strategy, "strategy", "s", "bluegreen",
-		fmt.Sprintf("the deployment strategy (bluegreen, gitrev, uuid) [%s]", atroctlStrategy))
+	deployCmd.Flags().StringVarP(&funcDir, "funcDir", "f", "", fmt.Sprintf("the directory that contains functions to deploy [%s]", atroctlFuncDir))
+	deployCmd.Flags().StringVarP(&staticDir, "staticDir", "s", "", fmt.Sprintf("the directory that contains static assets to deploy [%s]", atroctlStaticDir))
+	deployCmd.Flags().StringVarP(&strategy, "strategy", "g", "", fmt.Sprintf("the deployment strategy (bluegreen, gitrev, uuid) [%s]", atroctlStrategy))
 	deployCmd.Flags().BoolVarP(&watch, "watch", "w", false, "deploy when directory changes")
 	rootCmd.AddCommand(deployCmd)
 
-	if strategy == "" {
-		strategy = os.Getenv(atroctlStrategy)
-	}
+	funcDir = resolveStringFlag(funcDir, atroctlFuncDir, "src")
+	staticDir = resolveStringFlag(staticDir, atroctlStaticDir, "")
+	strategy = resolveStringFlag(strategy, atroctlStaticDir, "bluegreen")
 }
