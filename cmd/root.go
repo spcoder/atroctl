@@ -22,7 +22,7 @@ const (
 
 var rootCmd = &cobra.Command{
 	Use:     "atroctl",
-	Version: "1.3.0",
+	Version: "1.6.0",
 	Short:   "atroctl controls Atrocity instances",
 	Long:    `The atroctl command lets you control instances of Atrocity.`,
 }

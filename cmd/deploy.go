@@ -2,18 +2,22 @@ package cmd
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"io/ioutil"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
 	"github.com/fsnotify/fsnotify"
 
 	"github.com/spf13/cobra"
+
+	"github.com/evanw/esbuild/pkg/api"
 )
 
 var (
@@ -206,11 +210,15 @@ func bluegreen() error {
 
 func deploy(deployId string) error {
 	p(strategy, "deploying to %s\n", deployId)
-	err := deploySecrets(deployId)
+	err := beginDeployment(deployId)
 	if err != nil {
 		return err
 	}
-	err = deployFunctions(deployId)
+	err = deploySecrets(deployId)
+	if err != nil {
+		return err
+	}
+	err = deployFunction(deployId)
 	if err != nil {
 		return err
 	}
@@ -257,29 +265,42 @@ func deploySecrets(deployId string) error {
 	return nil
 }
 
-func deployFunctions(deployId string) error {
-	p("functions", "starting to deploy functions in '%s'\n", funcDir)
-	files, err := glob(funcDir, ".js")
-	if err != nil {
-		return fmt.Errorf("error globbing files: %w", err)
+func bundle() ([]byte, error) {
+	entryFile := path.Join(funcDir, "index.js")
+	result := api.Build(api.BuildOptions{
+		Bundle:      true,
+		EntryPoints: []string{entryFile},
+		Platform:    api.PlatformNode,
+		LogLevel:    api.LogLevelInfo,
+	})
+	if len(result.Errors) > 0 {
+		for _, err := range result.Errors {
+			fmt.Println(err.Text)
+		}
+		return nil, errors.New("error while bundling")
 	}
-	for _, f := range files {
-		p("functions", "deploying file %s", f)
-		contents, err := ioutil.ReadFile(f)
-		if err != nil {
-			return fmt.Errorf("error reading file (%s): %w", f, err)
-		}
-		basename := filepath.Base(f)
-		resp, err := httpPut(fmt.Sprintf("%s/deploy/%s/function/%s", url, deployId, basename), "text/plain", bytes.NewReader(contents))
-		if err != nil {
-			return fmt.Errorf("error deploying function (%s): %w", f, err)
-		}
-		if resp.StatusCode == http.StatusNoContent {
-			p("", " [OK]\n")
-		} else {
-			p("", " [%d]\n", resp.StatusCode)
-			return fmt.Errorf("failed to deploy function (%s)", f)
-		}
+	return result.OutputFiles[0].Contents, nil
+}
+
+func deployFunction(deployId string) error {
+	p("functions", "starting to deploy functions in '%s'\n", funcDir)
+	p("functions", "creating bundle")
+	content, err := bundle()
+	if err != nil {
+		return err
+	}
+	p("", " [OK]\n")
+
+	p("functions", "deploying bundle")
+	resp, err := httpPut(fmt.Sprintf("%s/deploy/%s/function", url, deployId), "text/plain", bytes.NewReader(content))
+	if err != nil {
+		return fmt.Errorf("error deploying bundle: %w", err)
+	}
+	if resp.StatusCode == http.StatusNoContent {
+		p("", " [OK]\n")
+	} else {
+		p("", " [%d]\n", resp.StatusCode)
+		return fmt.Errorf("failed to deploy bundle")
 	}
 	p("functions", "successfully deployed\n")
 	return nil
@@ -325,6 +346,20 @@ func removeDir(f, dir string) string {
 	return s
 }
 
+func beginDeployment(deployId string) error {
+	p("begin", "starting deployment %s\n", deployId)
+	resp, err := httpPost(fmt.Sprintf("%s/deploy/%s/begin", url, deployId), "text/plain", nil)
+	if err != nil {
+		return fmt.Errorf("error starting deployment: %w", err)
+	}
+	if resp.StatusCode == http.StatusNoContent {
+		p("begin", "successfully started deployment %s\n", deployId)
+	} else {
+		return fmt.Errorf("failed to begin deployment: %w", err)
+	}
+	return nil
+}
+
 func activateDeployment(deployId string) error {
 	p("activate", "starting to activate %s\n", deployId)
 	resp, err := httpPost(fmt.Sprintf("%s/deploy/%s/activate", url, deployId), "text/plain", nil)
@@ -337,17 +372,6 @@ func activateDeployment(deployId string) error {
 		return fmt.Errorf("failed to activate deployment: %w", err)
 	}
 	return nil
-}
-
-func glob(dir string, ext string) ([]string, error) {
-	files := make([]string, 0)
-	err := filepath.Walk(dir, func(path string, f os.FileInfo, err error) error {
-		if filepath.Ext(path) == ext {
-			files = append(files, path)
-		}
-		return nil
-	})
-	return files, err
 }
 
 func globAll(dir string) ([]string, error) {
