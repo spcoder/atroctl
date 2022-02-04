@@ -21,16 +21,18 @@ import (
 )
 
 var (
-	funcDir   string
-	staticDir string
-	strategy  string
-	watch     bool
+	funcDir     string
+	staticDir   string
+	resourceDir string
+	strategy    string
+	watch       bool
 )
 
 const (
-	atroctlFuncDir   = "ATROCTL_FUNC_DIR"
-	atroctlStaticDir = "ATROCTL_STATIC_DIR"
-	atroctlStrategy  = "ATROCTL_STRATEGY"
+	atroctlFuncDir     = "ATROCTL_FUNC_DIR"
+	atroctlStaticDir   = "ATROCTL_STATIC_DIR"
+	atroctlResourceDir = "ATROCTL_RESOURCE_DIR"
+	atroctlStrategy    = "ATROCTL_STRATEGY"
 )
 
 var deployCmd = &cobra.Command{
@@ -148,6 +150,15 @@ func startWatching(fn strategyFunction) error {
 		}
 		return nil
 	})
+	if resourceDir != "" {
+		err = filepath.WalkDir(resourceDir, func(path string, d fs.DirEntry, err error) error {
+			if d.IsDir() {
+				p("watch", path+"\n")
+				return watcher.Add(path)
+			}
+			return nil
+		})
+	}
 	if staticDir != "" {
 		err = filepath.WalkDir(staticDir, func(path string, d fs.DirEntry, err error) error {
 			if d.IsDir() {
@@ -222,6 +233,10 @@ func deploy(deployId string) error {
 	if err != nil {
 		return err
 	}
+	err = deployResources(deployId)
+	if err != nil {
+		return err
+	}
 	err = deployStatics(deployId)
 	if err != nil {
 		return err
@@ -268,10 +283,14 @@ func deploySecrets(deployId string) error {
 func bundle() ([]byte, error) {
 	entryFile := path.Join(funcDir, "index.js")
 	result := api.Build(api.BuildOptions{
-		Bundle:      true,
-		EntryPoints: []string{entryFile},
-		Platform:    api.PlatformNode,
-		LogLevel:    api.LogLevelInfo,
+		Bundle:           true,
+		MinifySyntax:     true,
+		MinifyWhitespace: true,
+		Color:            api.ColorNever,
+		TreeShaking:      api.TreeShakingFalse,
+		EntryPoints:      []string{entryFile},
+		Platform:         api.PlatformNode,
+		LogLevel:         api.LogLevelInfo,
 	})
 	if len(result.Errors) > 0 {
 		for _, err := range result.Errors {
@@ -303,6 +322,38 @@ func deployFunction(deployId string) error {
 		return fmt.Errorf("failed to deploy bundle")
 	}
 	p("functions", "successfully deployed\n")
+	return nil
+}
+
+func deployResources(deployId string) error {
+	if resourceDir == "" {
+		return nil
+	}
+	p("resources", "starting to deploy resource files in '%s'\n", resourceDir)
+	files, err := globAll(resourceDir)
+	if err != nil {
+		return fmt.Errorf("error globbing files: %w", err)
+	}
+	for _, f := range files {
+		p("resources", "deploying file %s", f)
+		contents, err := ioutil.ReadFile(f)
+		if err != nil {
+			return fmt.Errorf("error reading file (%s): %w", f, err)
+		}
+		fpath := filepath.ToSlash(removeDir(f, resourceDir))
+		contentType := http.DetectContentType(contents)
+		resp, err := httpPut(fmt.Sprintf("%s/deploy/%s/resource/%s", url, deployId, fpath), contentType, bytes.NewReader(contents))
+		if err != nil {
+			return fmt.Errorf("error deploying resource file (%s): %w", f, err)
+		}
+		if resp.StatusCode == http.StatusNoContent {
+			p("", " [OK]\n")
+		} else {
+			p("", " [%d]\n", resp.StatusCode)
+			return fmt.Errorf("failed to deploy resource file (%s)", f)
+		}
+	}
+	p("resources", "successfully deployed\n")
 	return nil
 }
 
@@ -355,7 +406,7 @@ func beginDeployment(deployId string) error {
 	if resp.StatusCode == http.StatusNoContent {
 		p("begin", "successfully started deployment %s\n", deployId)
 	} else {
-		return fmt.Errorf("failed to begin deployment: %w", err)
+		return fmt.Errorf("failed to begin deployment: status code = %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -369,7 +420,7 @@ func activateDeployment(deployId string) error {
 	if resp.StatusCode == http.StatusNoContent {
 		p("activate", "successfully activated %s\n", deployId)
 	} else {
-		return fmt.Errorf("failed to activate deployment: %w", err)
+		return fmt.Errorf("failed to activate deployment: status code = %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -418,12 +469,14 @@ func resolveStringFlag(value, envvar, fallback string) string {
 
 func init() {
 	deployCmd.Flags().StringVarP(&funcDir, "funcDir", "f", "", fmt.Sprintf("the directory that contains functions to deploy [%s]", atroctlFuncDir))
+	deployCmd.Flags().StringVarP(&resourceDir, "resourceDir", "r", "", fmt.Sprintf("the directory that contains resource files to deploy [%s]", atroctlResourceDir))
 	deployCmd.Flags().StringVarP(&staticDir, "staticDir", "s", "", fmt.Sprintf("the directory that contains static assets to deploy [%s]", atroctlStaticDir))
 	deployCmd.Flags().StringVarP(&strategy, "strategy", "g", "", fmt.Sprintf("the deployment strategy (bluegreen, gitrev, uuid) [%s]", atroctlStrategy))
 	deployCmd.Flags().BoolVarP(&watch, "watch", "w", false, "deploy when directory changes")
 	rootCmd.AddCommand(deployCmd)
 
 	funcDir = resolveStringFlag(funcDir, atroctlFuncDir, "src")
+	resourceDir = resolveStringFlag(resourceDir, atroctlResourceDir, "")
 	staticDir = resolveStringFlag(staticDir, atroctlStaticDir, "")
 	strategy = resolveStringFlag(strategy, atroctlStaticDir, "bluegreen")
 }
